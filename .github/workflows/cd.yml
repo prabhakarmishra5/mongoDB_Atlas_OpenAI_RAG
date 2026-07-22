@@ -16,12 +16,13 @@ jobs:
     runs-on: ubuntu-latest
     env:
       PYTHONUNBUFFERED: 1
+      GH_TOKEN: ${{ github.token }}
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
@@ -34,16 +35,15 @@ jobs:
         run: |
           python -m build
 
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: mongodb-rag-dist
-          path: dist/
+      - name: Upload build artifact to workflow run
+        run: |
+          mkdir -p artifacts
+          cp -r dist artifacts/dist
+          tar -czf artifacts/mongodb-rag-dist.tgz -C artifacts dist
 
       - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: release-${{ github.event.workflow_run.head_sha || github.sha }}
-          name: Release ${{ github.event.workflow_run.head_sha || github.sha }}
-          files: dist/*
-          generate_release_notes: true
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          TAG="release-$SHORT_SHA"
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "Release $SHORT_SHA" --generate-notes
+          gh release upload "$TAG" artifacts/mongodb-rag-dist.tgz --clobber
