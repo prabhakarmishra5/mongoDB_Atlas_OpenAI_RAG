@@ -68,7 +68,19 @@ The results are written to `evaluation_results.json` by default.
 Run unit tests with:
 
 ```bash
-python -m unittest discover
+python -m unittest discover -s tests -v
+```
+
+## CI/CD
+
+This repository includes a GitHub Actions workflow in [.github/workflows/ci.yml](.github/workflows/ci.yml) that installs dependencies and runs the test suite on every push and pull request.
+
+## Non-interactive usage
+
+You can run the retrieval flow in CI or automation without prompts:
+
+```bash
+python retrival.py --question "What does Atlas Vector Search do?" --no-confirm
 ```
 
 ## Notes

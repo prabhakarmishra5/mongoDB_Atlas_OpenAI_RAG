@@ -1,6 +1,8 @@
+import argparse
 import logging
 import os
 import urllib.parse
+from typing import Optional, Sequence
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -15,24 +17,29 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 MONGODB_USERNAME = os.environ.get("MONGODB_USERNAME")
 MONGODB_PASSWORD = os.environ.get("MONGODB_PASSWORD")
 MONGODB_CLUSTER = os.environ.get("MONGODB_CLUSTER", "cluster0.aefs3mv.mongodb.net")
-DATABASE_NAME = "rag_database"
-COLLECTION_NAME = "knowledge_base"
-EMBEDDING_MODEL = "text-embedding-3-small"
-CHAT_MODEL = "gpt-4o-mini"
-VECTOR_INDEX_NAME = "vector_index"
-VECTOR_PATH = "text_embedding"
-NUM_CANDIDATES = 10
-RESULT_LIMIT = 2
+DATABASE_NAME = os.environ.get("DATABASE_NAME", "rag_database")
+COLLECTION_NAME = os.environ.get("COLLECTION_NAME", "knowledge_base")
+EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small")
+CHAT_MODEL = os.environ.get("CHAT_MODEL", "gpt-4o-mini")
+VECTOR_INDEX_NAME = os.environ.get("VECTOR_INDEX_NAME", "vector_index")
+VECTOR_PATH = os.environ.get("VECTOR_PATH", "text_embedding")
+NUM_CANDIDATES = int(os.environ.get("NUM_CANDIDATES", "10"))
+RESULT_LIMIT = int(os.environ.get("RESULT_LIMIT", "2"))
 
 # Setup logging
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
 
+openai_client = None
+mongo_client = None
+collection = None
 
-# Validate environment variables
+
 def validate_credentials():
+    """Validate that all required environment variables are set."""
     required_vars = {
         "OPENAI_API_KEY": OPENAI_API_KEY,
         "MONGODB_USERNAME": MONGODB_USERNAME,
@@ -44,12 +51,6 @@ def validate_credentials():
     logger.info("✓ All credentials validated")
 
 
-# Create clients after validation
-validate_credentials()
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
-
-
-# Build MongoDB connection string
 def build_mongodb_uri():
     """Build MongoDB connection string with properly encoded credentials."""
     username = urllib.parse.quote_plus(MONGODB_USERNAME)
@@ -57,18 +58,36 @@ def build_mongodb_uri():
     return f"mongodb+srv://{username}:{password}@{MONGODB_CLUSTER}/?appName=Cluster0&compressors=zlib"
 
 
-# Initialize MongoDB
-try:
-    mongo_uri = build_mongodb_uri()
-    mongo_client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
-    mongo_client.admin.command("ping")
-    db = mongo_client[DATABASE_NAME]
-    collection = db[COLLECTION_NAME]
-    logger.info("✓ Connected to MongoDB Atlas")
-except ServerSelectionTimeoutError:
-    raise ConnectionError("Failed to connect to MongoDB Atlas")
-except Exception as e:
-    raise Exception(f"MongoDB initialization error: {str(e)}")
+def get_openai_client():
+    """Create and cache the OpenAI client on demand."""
+    global openai_client
+    if openai_client is None:
+        validate_credentials()
+        openai_client = OpenAI(api_key=OPENAI_API_KEY)
+    return openai_client
+
+
+def get_mongo_collection():
+    """Create and cache the MongoDB collection on demand."""
+    global mongo_client, collection
+    if collection is None:
+        validate_credentials()
+        mongo_uri = build_mongodb_uri()
+        mongo_client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
+        mongo_client.admin.command("ping")
+        db = mongo_client[DATABASE_NAME]
+        collection = db[COLLECTION_NAME]
+        logger.info("✓ Connected to MongoDB Atlas")
+    return collection
+
+
+def close_clients():
+    """Close any open MongoDB client connection."""
+    global mongo_client, collection
+    if mongo_client is not None:
+        mongo_client.close()
+        mongo_client = None
+        collection = None
 
 
 def prompt_for_question():
@@ -100,20 +119,21 @@ def get_brain_response(user_query):
         ValueError: If user_query is empty or invalid
         Exception: If API calls fail
     """
-    # Validate input
     if not user_query or not user_query.strip():
         raise ValueError("User query cannot be empty")
 
     user_query = user_query.strip()
 
     try:
-        # 1. Vectorize user prompt
-        embeddings_response = openai_client.embeddings.create(
-            input=user_query, model=EMBEDDING_MODEL
+        openai_client_instance = get_openai_client()
+        collection_instance = get_mongo_collection()
+
+        embeddings_response = openai_client_instance.embeddings.create(
+            input=user_query,
+            model=EMBEDDING_MODEL,
         )
         query_embedding = embeddings_response.data[0].embedding
 
-        # 2. Query MongoDB using $vectorSearch stage
         pipeline = [
             {
                 "$vectorSearch": {
@@ -127,22 +147,19 @@ def get_brain_response(user_query):
             {"$project": {"_id": 0, "text": 1}},
         ]
 
-        results = list(collection.aggregate(pipeline))
+        results = list(collection_instance.aggregate(pipeline))
 
-        # 3. Handle empty results
         if not results:
             return "No relevant documents found in the knowledge base."
 
-        # 4. Combine matching documents into one context block
         context = "\n".join([doc.get("text", "") for doc in results])
 
         if not context.strip():
             return "Retrieved documents contain no text content."
 
-        # 5. Generate grounded LLM response
         system_prompt = f"Answer the query using only this context:\n{context}"
 
-        completion = openai_client.chat.completions.create(
+        completion = openai_client_instance.chat.completions.create(
             model=CHAT_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -152,25 +169,47 @@ def get_brain_response(user_query):
 
         return completion.choices[0].message.content
 
-    except OperationFailure as e:
-        raise Exception(f"MongoDB query failed: {str(e)}")
-    except Exception as e:
-        raise Exception(f"Error in get_brain_response: {str(e)}")
+    except ServerSelectionTimeoutError as exc:
+        raise ConnectionError("Failed to connect to MongoDB Atlas") from exc
+    except OperationFailure as exc:
+        raise Exception(f"MongoDB query failed: {str(exc)}")
+    except Exception as exc:
+        raise Exception(f"Error in get_brain_response: {str(exc)}")
 
 
-# Execute RAG System
-if __name__ == "__main__":
+def build_parser() -> argparse.ArgumentParser:
+    """Create a CLI parser for non-interactive execution in CI/CD."""
+    parser = argparse.ArgumentParser(description="Query the MongoDB RAG system")
+    parser.add_argument("--question", help="Question to answer")
+    parser.add_argument(
+        "--no-confirm",
+        action="store_true",
+        help="Skip the confirmation prompt",
+    )
+    return parser
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Run the retrieval flow from the command line."""
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
     try:
-        user_question = prompt_for_question()
-        if not confirm_proceed():
+        user_question = args.question or prompt_for_question()
+        if not args.no_confirm and not confirm_proceed():
             print("Operation cancelled by user.")
-            raise SystemExit(0)
+            return 0
 
         response = get_brain_response(user_question)
         print(f"Query: {user_question}\n")
         print(f"Response: {response}")
-    except Exception as e:
-        print(f"Error: {str(e)}")
+        return 0
+    except Exception as exc:
+        print(f"Error: {str(exc)}")
+        return 1
     finally:
-        # Close MongoDB connection
-        mongo_client.close()
+        close_clients()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

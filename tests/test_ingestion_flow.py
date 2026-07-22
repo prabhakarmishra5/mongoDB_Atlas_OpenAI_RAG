@@ -1,3 +1,6 @@
+import importlib
+import os
+import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -59,6 +62,15 @@ class IngestionFlowTests(unittest.TestCase):
             "What does Atlas Vector Search eliminate the need for?",
         )
         self.assertTrue(confirmed)
+
+    def test_retrieval_module_can_be_reloaded_without_credentials(self):
+        with patch.dict(os.environ, {}, clear=True):
+            sys.modules.pop("retrival", None)
+            reloaded_module = importlib.import_module("retrival")
+
+        self.assertTrue(hasattr(reloaded_module, "prompt_for_question"))
+        self.assertIsNone(reloaded_module.mongo_client)
+        self.assertIsNone(reloaded_module.collection)
 
 
 if __name__ == "__main__":
