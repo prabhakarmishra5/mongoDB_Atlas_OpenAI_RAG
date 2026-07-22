@@ -1,0 +1,6 @@
+pymongo
+openai
+langchain-text-splitters
+dotenv
+pypdf
+ruff

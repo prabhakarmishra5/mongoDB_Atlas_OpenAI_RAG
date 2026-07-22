@@ -1,0 +1,32 @@
+[
+  {
+    "question": "What does MongoDB Atlas Vector Search eliminate the need for?",
+    "answer": "The context provided does not contain specific information about what MongoDB Atlas Vector Search eliminates the need for. Therefore, I cannot provide an answer based on the given context.",
+    "score": 3,
+    "notes": "AA"
+  },
+  {
+    "question": "What is the purpose of this system?",
+    "answer": "The purpose of the system is to enhance capabilities across various domains, including communication systems, power grids, retail experiences, and even complex missions like those to Mars, by focusing on components, group identification, and the overall robustness of the system.",
+    "score": 3,
+    "notes": "AA"
+  },
+  {
+    "question": "Do you know me?",
+    "answer": "I don\u2019t have personal knowledge of individuals. My training only includes general information and does not include personal data about users.",
+    "score": 3,
+    "notes": "AA"
+  },
+  {
+    "question": "How old I am?",
+    "answer": "I'm sorry, but I cannot determine your age based on the provided information.",
+    "score": 3,
+    "notes": "AA"
+  },
+  {
+    "question": "How old are you?",
+    "answer": "I am an AI language model and do not have an age.",
+    "score": 3,
+    "notes": "AA"
+  }
+]
