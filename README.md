@@ -6,6 +6,7 @@ A retrieval-augmented generation (RAG) demo using MongoDB Atlas Vector Search, O
 
 This repository provides:
 
+- `rag_common.py`: shared configuration, MongoDB/OpenAI clients, prompt and JSON helpers used by the scripts below
 - `ingestion.py`: ingest PDF documents from `sourceFile/` into MongoDB Atlas using OpenAI embeddings
 - `retrival.py`: query MongoDB and generate answers using OpenAI chat completions
 - `evaluate_rag.py`: run sample questions and optionally save evaluation results to `evaluation_results.json`
@@ -88,3 +89,4 @@ python retrival.py --question "What does Atlas Vector Search do?" --no-confirm
 - `ingestion.py` uses `langchain_text_splitters.RecursiveCharacterTextSplitter` for chunking.
 - `retrival.py` uses MongoDB Atlas vector search and OpenAI `gpt-4o-mini` for response generation.
 - `evaluate_rag.py` can be extended to use a custom scoring callback.
+- Configuration, credential validation, connection setup, and CLI prompts live in `rag_common.py`; add new shared behaviour there instead of duplicating it per script.
