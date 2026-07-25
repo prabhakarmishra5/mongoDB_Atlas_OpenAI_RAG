@@ -11,12 +11,14 @@ from openai import OpenAI
 from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError, ServerSelectionTimeoutError
 
+from security import redact_credentials
+
 # Configuration
 load_dotenv()  # Load from .env file
 
 MONGODB_USERNAME = os.environ.get("MONGODB_USERNAME")
 MONGODB_PASSWORD = os.environ.get("MONGODB_PASSWORD")
-MONGODB_CLUSTER = os.environ.get("MONGODB_CLUSTER", "cluster0.aefs3mv.mongodb.net")
+MONGODB_CLUSTER = os.environ.get("MONGODB_CLUSTER")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
 DATABASE_NAME = "rag_database"
@@ -43,6 +45,7 @@ def validate_credentials():
         "MONGODB_USERNAME": MONGODB_USERNAME,
         "MONGODB_PASSWORD": MONGODB_PASSWORD,
         "OPENAI_API_KEY": OPENAI_API_KEY,
+        "MONGODB_CLUSTER": MONGODB_CLUSTER,
     }
 
     missing = [var for var, val in required_vars.items() if not val]
@@ -186,7 +189,7 @@ def ingest_documents(raw_text):
             collection.create_index([("text_embedding", "2dsphere")])
             logger.info("Vector search index ready")
         except Exception as exc:
-            logger.warning(f"Index creation skipped: {str(exc)}")
+            logger.warning(f"Index creation skipped: {redact_credentials(exc)}")
 
         # Initialize OpenAI Client
         openai_client = OpenAI(api_key=OPENAI_API_KEY)
@@ -223,7 +226,7 @@ def ingest_documents(raw_text):
             except DuplicateKeyError:
                 logger.warning(f"Chunk {i} already exists (skipped)")
             except Exception as exc:
-                logger.error(f"Failed to ingest chunk {i}: {str(exc)}")
+                logger.error(f"Failed to ingest chunk {i}: {redact_credentials(exc)}")
                 continue
 
         logger.info(
@@ -237,7 +240,7 @@ def ingest_documents(raw_text):
         )
         raise
     except Exception as exc:
-        logger.error(f"Ingestion failed: {str(exc)}")
+        logger.error(f"Ingestion failed: {redact_credentials(exc)}")
         raise
     finally:
         if client is not None:
@@ -270,5 +273,5 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as exc:
-        logger.error(f"Script failed: {str(exc)}")
+        logger.error(f"Script failed: {redact_credentials(exc)}")
         raise SystemExit(1)
