@@ -31,7 +31,7 @@ MONGODB_PASSWORD=your_mongodb_password
 MONGODB_CLUSTER=your_cluster_uri
 ```
 
-If `MONGODB_CLUSTER` is omitted, it defaults to `cluster0.aefs3mv.mongodb.net`.
+All four values are required; there is no default cluster host. Never commit a real `.env` file — it is ignored by `.gitignore`.
 
 ## Ingestion
 

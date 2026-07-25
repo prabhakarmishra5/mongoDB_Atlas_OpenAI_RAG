@@ -1,6 +1,6 @@
-pymongo
-openai
-langchain-text-splitters
-dotenv
-pypdf
-ruff
+pymongo>=4.9,<5
+openai>=1.55,<2
+langchain-text-splitters>=0.3,<0.4
+python-dotenv>=1.0,<2
+pypdf>=5.1,<6
+ruff>=0.7,<1

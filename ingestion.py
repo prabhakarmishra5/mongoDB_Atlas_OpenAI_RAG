@@ -13,6 +13,7 @@ from rag_common import (
     create_openai_client,
     embed_text,
     read_json_dict,
+    redact_credentials,
     validate_credentials,
     write_json,
 )
@@ -133,7 +134,7 @@ def ingest_documents(raw_text):
             collection.create_index([("text_embedding", "2dsphere")])
             logger.info("Vector search index ready")
         except Exception as exc:
-            logger.warning(f"Index creation skipped: {str(exc)}")
+            logger.warning(f"Index creation skipped: {redact_credentials(exc)}")
 
         openai_client = create_openai_client()
 
@@ -163,7 +164,7 @@ def ingest_documents(raw_text):
             except DuplicateKeyError:
                 logger.warning(f"Chunk {i} already exists (skipped)")
             except Exception as exc:
-                logger.error(f"Failed to ingest chunk {i}: {str(exc)}")
+                logger.error(f"Failed to ingest chunk {i}: {redact_credentials(exc)}")
                 continue
 
         logger.info(
@@ -177,7 +178,7 @@ def ingest_documents(raw_text):
         )
         raise
     except Exception as exc:
-        logger.error(f"Ingestion failed: {str(exc)}")
+        logger.error(f"Ingestion failed: {redact_credentials(exc)}")
         raise
     finally:
         if client is not None:
@@ -210,5 +211,5 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as exc:
-        logger.error(f"Script failed: {str(exc)}")
+        logger.error(f"Script failed: {redact_credentials(exc)}")
         raise SystemExit(1)

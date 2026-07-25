@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import re
 import urllib.parse
 from pathlib import Path
 from typing import Any, Iterable, List, Tuple, Union
@@ -17,7 +18,7 @@ load_dotenv()
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 MONGODB_USERNAME = os.environ.get("MONGODB_USERNAME")
 MONGODB_PASSWORD = os.environ.get("MONGODB_PASSWORD")
-MONGODB_CLUSTER = os.environ.get("MONGODB_CLUSTER", "cluster0.aefs3mv.mongodb.net")
+MONGODB_CLUSTER = os.environ.get("MONGODB_CLUSTER")
 
 DATABASE_NAME = os.environ.get("DATABASE_NAME", "rag_database")
 COLLECTION_NAME = os.environ.get("COLLECTION_NAME", "knowledge_base")
@@ -30,6 +31,32 @@ RESULT_LIMIT = int(os.environ.get("RESULT_LIMIT", "2"))
 
 SERVER_SELECTION_TIMEOUT_MS = 5000
 LOG_FORMAT = "%(asctime)s - %(levelname)s - %(message)s"
+MAX_QUERY_LENGTH = 2000
+
+_URI_CREDENTIALS = re.compile(
+    r"(?P<scheme>mongodb(?:\+srv)?://)[^@\s/]*@",
+    re.IGNORECASE,
+)
+
+
+def redact_credentials(value: Any) -> str:
+    """Replace inline credentials in MongoDB URIs with placeholders."""
+    return _URI_CREDENTIALS.sub(r"\g<scheme>***:***@", str(value))
+
+
+def sanitize_query(user_query: Any, max_length: int = MAX_QUERY_LENGTH) -> str:
+    """Validate and normalise a user supplied query string."""
+    if not isinstance(user_query, str) or not user_query.strip():
+        raise ValueError("User query cannot be empty")
+
+    query = user_query.strip()
+    if len(query) > max_length:
+        raise ValueError(f"User query exceeds {max_length} characters")
+
+    if "\x00" in query:
+        raise ValueError("User query contains null bytes")
+
+    return query
 
 
 def configure_logger(name: str) -> logging.Logger:
@@ -47,6 +74,7 @@ def validate_credentials() -> None:
         "OPENAI_API_KEY": OPENAI_API_KEY,
         "MONGODB_USERNAME": MONGODB_USERNAME,
         "MONGODB_PASSWORD": MONGODB_PASSWORD,
+        "MONGODB_CLUSTER": MONGODB_CLUSTER,
     }
 
     missing = [name for name, value in required_vars.items() if not value]
