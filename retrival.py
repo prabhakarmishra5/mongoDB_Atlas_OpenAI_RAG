@@ -5,12 +5,30 @@ import urllib.parse
 from typing import Optional, Sequence
 
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import OpenAI, OpenAIError
 from pymongo import MongoClient
-from pymongo.errors import OperationFailure, ServerSelectionTimeoutError
+from pymongo.errors import (
+    OperationFailure,
+    PyMongoError,
+    ServerSelectionTimeoutError,
+)
 
 # Load environment variables
 load_dotenv()
+
+
+class RetrievalError(RuntimeError):
+    """Raised when the retrieval pipeline cannot produce an answer."""
+
+
+def _env_int(name, default):
+    """Read an integer setting, failing loudly on malformed values."""
+    raw = os.environ.get(name, default)
+    try:
+        return int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
+
 
 # Configuration
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
@@ -23,8 +41,8 @@ EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small")
 CHAT_MODEL = os.environ.get("CHAT_MODEL", "gpt-4o-mini")
 VECTOR_INDEX_NAME = os.environ.get("VECTOR_INDEX_NAME", "vector_index")
 VECTOR_PATH = os.environ.get("VECTOR_PATH", "text_embedding")
-NUM_CANDIDATES = int(os.environ.get("NUM_CANDIDATES", "10"))
-RESULT_LIMIT = int(os.environ.get("RESULT_LIMIT", "2"))
+NUM_CANDIDATES = _env_int("NUM_CANDIDATES", "10")
+RESULT_LIMIT = _env_int("RESULT_LIMIT", "2")
 
 # Setup logging
 logging.basicConfig(
@@ -85,9 +103,14 @@ def close_clients():
     """Close any open MongoDB client connection."""
     global mongo_client, collection
     if mongo_client is not None:
-        mongo_client.close()
-        mongo_client = None
-        collection = None
+        try:
+            mongo_client.close()
+        except PyMongoError as exc:
+            # Never let cleanup mask the original failure.
+            logger.warning(f"Failed to close MongoDB connection: {str(exc)}")
+        finally:
+            mongo_client = None
+            collection = None
 
 
 def prompt_for_question():
@@ -117,7 +140,8 @@ def get_brain_response(user_query):
 
     Raises:
         ValueError: If user_query is empty or invalid
-        Exception: If API calls fail
+        ConnectionError: If MongoDB Atlas is unreachable
+        RetrievalError: If the MongoDB query or an OpenAI call fails
     """
     if not user_query or not user_query.strip():
         raise ValueError("User query cannot be empty")
@@ -167,14 +191,23 @@ def get_brain_response(user_query):
             ],
         )
 
-        return completion.choices[0].message.content
+        if not completion.choices:
+            raise RetrievalError(f"{CHAT_MODEL} returned no completion choices")
+
+        answer = completion.choices[0].message.content
+        if answer is None or not answer.strip():
+            raise RetrievalError(f"{CHAT_MODEL} returned an empty answer")
+
+        return answer
 
     except ServerSelectionTimeoutError as exc:
-        raise ConnectionError("Failed to connect to MongoDB Atlas") from exc
+        raise ConnectionError(f"Failed to connect to MongoDB Atlas: {exc}") from exc
     except OperationFailure as exc:
-        raise Exception(f"MongoDB query failed: {str(exc)}")
-    except Exception as exc:
-        raise Exception(f"Error in get_brain_response: {str(exc)}")
+        raise RetrievalError(f"MongoDB query failed: {exc}") from exc
+    except PyMongoError as exc:
+        raise RetrievalError(f"MongoDB request failed: {exc}") from exc
+    except OpenAIError as exc:
+        raise RetrievalError(f"OpenAI request failed: {exc}") from exc
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -204,8 +237,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"Query: {user_question}\n")
         print(f"Response: {response}")
         return 0
+    except KeyboardInterrupt:
+        print("Operation cancelled by user.")
+        return 130
+    except (RetrievalError, ConnectionError, ValueError) as exc:
+        logger.error(str(exc))
+        return 1
     except Exception as exc:
-        print(f"Error: {str(exc)}")
+        logger.exception(f"Unexpected failure: {str(exc)}")
         return 1
     finally:
         close_clients()

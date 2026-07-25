@@ -61,7 +61,9 @@ Run sample question evaluation and save results:
 python evaluate_rag.py
 ```
 
-The results are written to `evaluation_results.json` by default.
+The results are written to `evaluation_results.json` by default. Each entry includes an
+`error` field: questions that fail are recorded there and the run continues, but the
+script exits with a non-zero status (and raises if every question fails).
 
 ## Testing
 
