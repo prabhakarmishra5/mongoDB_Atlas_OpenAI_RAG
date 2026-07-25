@@ -1,12 +1,11 @@
-import json
-import logging
 import sys
 from pathlib import Path
 from typing import Callable, List, Optional
 
 import retrival
+from rag_common import configure_logger, prompt_choice, write_json
 
-logger = logging.getLogger(__name__)
+logger = configure_logger(__name__)
 
 
 def run_question(
@@ -26,10 +25,11 @@ def score_answer(answer: str, interactive: bool = True) -> tuple[Optional[int], 
 
     print("\nScore the answer on a 1-5 scale:")
     print("1 = poor, 2 = weak, 3 = acceptable, 4 = good, 5 = excellent")
-    score = input("Score (1-5): ").strip()
-    while score not in {"1", "2", "3", "4", "5"}:
-        print("Please enter a number from 1 to 5.")
-        score = input("Score (1-5): ").strip()
+    score = prompt_choice(
+        "Score (1-5): ",
+        {"1", "2", "3", "4", "5"},
+        "Please enter a number from 1 to 5.",
+    )
 
     notes = input("Optional notes: ").strip()
     return int(score), notes
@@ -78,14 +78,7 @@ def evaluate_questions(
         )
 
     if output_path is not None:
-        path = Path(output_path)
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(results, indent=2), encoding="utf-8")
-        except OSError as exc:
-            raise OSError(
-                f"Failed to write evaluation results to {path}: {exc}"
-            ) from exc
+        write_json(output_path, results)
 
     if questions and len(failures) == len(questions):
         raise RuntimeError(
@@ -98,10 +91,6 @@ def evaluate_questions(
 
 def main() -> int:
     """Run the sample evaluation, reporting failures with a non-zero exit code."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(message)s",
-    )
     sample_questions = [
         "What does MongoDB Atlas Vector Search eliminate the need for?",
         "What is the purpose of this system?",
@@ -118,7 +107,7 @@ def main() -> int:
         print("Evaluation cancelled by user.")
         return 130
     except Exception as exc:
-        logger.error("Evaluation run failed: %s", exc)
+        logger.exception("Evaluation run failed: %s", exc)
         return 1
     finally:
         retrival.close_clients()

@@ -1,87 +1,45 @@
 import argparse
-import logging
-import os
-import urllib.parse
 from typing import Optional, Sequence
 
-from dotenv import load_dotenv
-from openai import OpenAI, OpenAIError
-from pymongo import MongoClient
+from openai import OpenAIError
 from pymongo.errors import (
     OperationFailure,
     PyMongoError,
     ServerSelectionTimeoutError,
 )
 
-# Load environment variables
-load_dotenv()
+from rag_common import (
+    CHAT_MODEL,
+    COLLECTION_NAME,
+    DATABASE_NAME,
+    VECTOR_INDEX_NAME,
+    VECTOR_PATH,
+    configure_logger,
+    confirm_yes,
+    connect_to_collection,
+    create_openai_client,
+    embed_text,
+    env_int,
+    prompt_non_empty,
+)
+
+logger = configure_logger(__name__)
 
 
 class RetrievalError(RuntimeError):
     """Raised when the retrieval pipeline cannot produce an answer."""
 
 
-def _env_int(name, default):
-    """Read an integer setting, failing loudly on malformed values."""
-    raw = os.environ.get(name, default)
-    try:
-        return int(raw)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
-
-
-# Configuration
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-MONGODB_USERNAME = os.environ.get("MONGODB_USERNAME")
-MONGODB_PASSWORD = os.environ.get("MONGODB_PASSWORD")
-MONGODB_CLUSTER = os.environ.get("MONGODB_CLUSTER", "cluster0.aefs3mv.mongodb.net")
-DATABASE_NAME = os.environ.get("DATABASE_NAME", "rag_database")
-COLLECTION_NAME = os.environ.get("COLLECTION_NAME", "knowledge_base")
-EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small")
-CHAT_MODEL = os.environ.get("CHAT_MODEL", "gpt-4o-mini")
-VECTOR_INDEX_NAME = os.environ.get("VECTOR_INDEX_NAME", "vector_index")
-VECTOR_PATH = os.environ.get("VECTOR_PATH", "text_embedding")
-NUM_CANDIDATES = _env_int("NUM_CANDIDATES", "10")
-RESULT_LIMIT = _env_int("RESULT_LIMIT", "2")
-
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
-logger = logging.getLogger(__name__)
-
 openai_client = None
 mongo_client = None
 collection = None
-
-
-def validate_credentials():
-    """Validate that all required environment variables are set."""
-    required_vars = {
-        "OPENAI_API_KEY": OPENAI_API_KEY,
-        "MONGODB_USERNAME": MONGODB_USERNAME,
-        "MONGODB_PASSWORD": MONGODB_PASSWORD,
-    }
-    missing = [name for name, value in required_vars.items() if not value]
-    if missing:
-        raise ValueError(f"Missing environment variables: {', '.join(missing)}")
-    logger.info("✓ All credentials validated")
-
-
-def build_mongodb_uri():
-    """Build MongoDB connection string with properly encoded credentials."""
-    username = urllib.parse.quote_plus(MONGODB_USERNAME)
-    password = urllib.parse.quote_plus(MONGODB_PASSWORD)
-    return f"mongodb+srv://{username}:{password}@{MONGODB_CLUSTER}/?appName=Cluster0&compressors=zlib"
 
 
 def get_openai_client():
     """Create and cache the OpenAI client on demand."""
     global openai_client
     if openai_client is None:
-        validate_credentials()
-        openai_client = OpenAI(api_key=OPENAI_API_KEY)
+        openai_client = create_openai_client()
     return openai_client
 
 
@@ -89,13 +47,10 @@ def get_mongo_collection():
     """Create and cache the MongoDB collection on demand."""
     global mongo_client, collection
     if collection is None:
-        validate_credentials()
-        mongo_uri = build_mongodb_uri()
-        mongo_client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
-        mongo_client.admin.command("ping")
-        db = mongo_client[DATABASE_NAME]
-        collection = db[COLLECTION_NAME]
-        logger.info("✓ Connected to MongoDB Atlas")
+        mongo_client, collection = connect_to_collection(
+            DATABASE_NAME,
+            COLLECTION_NAME,
+        )
     return collection
 
 
@@ -115,17 +70,15 @@ def close_clients():
 
 def prompt_for_question():
     """Prompt the user for a question to send to the RAG system."""
-    while True:
-        user_question = input("Enter your question: ").strip()
-        if user_question:
-            return user_question
-        print("Please enter a non-empty question.")
+    return prompt_non_empty(
+        "Enter your question: ",
+        "Please enter a non-empty question.",
+    )
 
 
 def confirm_proceed():
     """Ask the user to confirm they want to proceed with the current question."""
-    response = input("Type Yes to continue: ").strip()
-    return response.lower() == "yes"
+    return confirm_yes("Type Yes to continue: ")
 
 
 def get_brain_response(user_query):
@@ -139,7 +92,7 @@ def get_brain_response(user_query):
         str: The LLM-generated response
 
     Raises:
-        ValueError: If user_query is empty or invalid
+        ValueError: If user_query is empty or a search setting is malformed
         ConnectionError: If MongoDB Atlas is unreachable
         RetrievalError: If the MongoDB query or an OpenAI call fails
     """
@@ -147,16 +100,14 @@ def get_brain_response(user_query):
         raise ValueError("User query cannot be empty")
 
     user_query = user_query.strip()
+    num_candidates = env_int("NUM_CANDIDATES", 10)
+    result_limit = env_int("RESULT_LIMIT", 2)
 
     try:
         openai_client_instance = get_openai_client()
         collection_instance = get_mongo_collection()
 
-        embeddings_response = openai_client_instance.embeddings.create(
-            input=user_query,
-            model=EMBEDDING_MODEL,
-        )
-        query_embedding = embeddings_response.data[0].embedding
+        query_embedding = embed_text(openai_client_instance, user_query)
 
         pipeline = [
             {
@@ -164,8 +115,8 @@ def get_brain_response(user_query):
                     "index": VECTOR_INDEX_NAME,
                     "path": VECTOR_PATH,
                     "queryVector": query_embedding,
-                    "numCandidates": NUM_CANDIDATES,
-                    "limit": RESULT_LIMIT,
+                    "numCandidates": num_candidates,
+                    "limit": result_limit,
                 }
             },
             {"$project": {"_id": 0, "text": 1}},

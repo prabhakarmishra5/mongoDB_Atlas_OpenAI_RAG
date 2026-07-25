@@ -1,83 +1,116 @@
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 
 import evaluate_rag
 import ingestion as ingest_script
+import rag_common
 import retrival as retrieval_script
 
 
-class IngestionErrorHandlingTests(unittest.TestCase):
-    def test_load_ingestion_log_warns_on_unexpected_json_shape(self):
+class RagCommonErrorHandlingTests(unittest.TestCase):
+    def test_env_int_rejects_non_numeric_values(self):
+        with (
+            patch.dict("os.environ", {"NUM_CANDIDATES": "many"}),
+            self.assertRaises(ValueError) as ctx,
+        ):
+            rag_common.env_int("NUM_CANDIDATES", 10)
+
+        self.assertIn("must be an integer", str(ctx.exception))
+
+    def test_read_json_dict_warns_on_unexpected_json_shape(self):
         with TemporaryDirectory() as tmp_dir:
-            log_path = Path(tmp_dir) / "ingestion_log.json"
-            log_path.write_text('["not", "a", "dict"]', encoding="utf-8")
+            path = Path(tmp_dir) / "log.json"
+            path.write_text('["not", "a", "dict"]', encoding="utf-8")
 
-            with self.assertLogs(ingest_script.logger, level="WARNING") as logs:
-                history = ingest_script.load_ingestion_log(log_path)
+            with self.assertLogs(rag_common.logger, level="WARNING") as logs:
+                self.assertEqual(rag_common.read_json_dict(path, "bad log"), {})
 
-            self.assertEqual(history, {})
-            self.assertIn("starting fresh", logs.output[0])
+            self.assertIn("instead of an object", logs.output[0])
 
-    def test_load_ingestion_log_warns_on_unreadable_file(self):
+    def test_read_json_dict_warns_on_unreadable_file(self):
         with TemporaryDirectory() as tmp_dir:
-            log_path = Path(tmp_dir) / "ingestion_log.json"
-            log_path.write_text("{}", encoding="utf-8")
+            path = Path(tmp_dir) / "log.json"
+            path.write_text("{}", encoding="utf-8")
 
             with (
                 patch.object(Path, "open", side_effect=OSError("denied")),
-                self.assertLogs(ingest_script.logger, level="WARNING") as logs,
+                self.assertLogs(rag_common.logger, level="WARNING") as logs,
             ):
-                history = ingest_script.load_ingestion_log(log_path)
+                self.assertEqual(rag_common.read_json_dict(path, "bad log"), {})
 
-            self.assertEqual(history, {})
             self.assertIn("denied", logs.output[0])
 
-    def test_save_ingestion_log_reports_write_failure(self):
+    def test_write_json_reports_write_failure_with_path(self):
         with TemporaryDirectory() as tmp_dir:
-            log_path = Path(tmp_dir) / "ingestion_log.json"
+            path = Path(tmp_dir) / "log.json"
 
             with (
-                patch.object(Path, "open", side_effect=OSError("disk full")),
+                patch.object(Path, "write_text", side_effect=OSError("disk full")),
                 self.assertRaises(OSError) as ctx,
             ):
-                ingest_script.save_ingestion_log(log_path, "sample.pdf", "now")
+                rag_common.write_json(path, {"a": 1})
 
-            self.assertIn("Failed to write ingestion log", str(ctx.exception))
+        self.assertIn("Failed to write JSON", str(ctx.exception))
 
+
+@contextmanager
+def patched_ingestion_clients(mongo_client=None, collection=None):
+    """Stub out credential validation and the Atlas/OpenAI clients."""
+    mongo_client = mongo_client or MagicMock()
+    collection = collection or MagicMock()
+    with (
+        patch.object(ingest_script, "validate_credentials"),
+        patch.object(
+            ingest_script,
+            "connect_to_collection",
+            return_value=(mongo_client, collection),
+        ),
+        patch.object(ingest_script, "create_openai_client", return_value=MagicMock()),
+    ):
+        yield mongo_client, collection
+
+
+@contextmanager
+def patched_retrieval_clients(openai_client=None, collection=None):
+    """Stub out the cached retrieval clients and the embedding call."""
+    openai_client = openai_client or MagicMock()
+    collection = collection or MagicMock()
+    with (
+        patch.object(retrieval_script, "get_openai_client", return_value=openai_client),
+        patch.object(
+            retrieval_script, "get_mongo_collection", return_value=collection
+        ),
+        patch.object(retrieval_script, "embed_text", return_value=[0.1]),
+    ):
+        yield openai_client, collection
+
+
+class IngestionErrorHandlingTests(unittest.TestCase):
     def test_ingest_documents_raises_when_every_chunk_fails(self):
-        openai_client = MagicMock()
-        openai_client.embeddings.create.side_effect = RuntimeError("embedding down")
-
         with (
-            patch.object(ingest_script, "validate_credentials"),
-            patch.object(ingest_script, "build_connection_string", return_value="uri"),
-            patch.object(ingest_script, "MongoClient") as mongo_client_cls,
-            patch.object(ingest_script, "OpenAI", return_value=openai_client),
+            patched_ingestion_clients() as (mongo_client, _),
+            patch.object(
+                ingest_script, "embed_text", side_effect=RuntimeError("embed boom")
+            ),
             self.assertRaises(RuntimeError) as ctx,
         ):
             ingest_script.ingest_documents("some text " * 100)
 
         self.assertIn("failed to ingest", str(ctx.exception))
         self.assertIsInstance(ctx.exception.__cause__, RuntimeError)
-        mongo_client_cls.return_value.close.assert_called_once()
+        mongo_client.close.assert_called_once()
 
     def test_ingest_documents_reports_partial_failures(self):
-        openai_client = MagicMock()
-        embedding_response = MagicMock()
-        embedding_response.data = [MagicMock(embedding=[0.1, 0.2])]
-        openai_client.embeddings.create.side_effect = [
-            embedding_response,
-            RuntimeError("embedding down"),
-            embedding_response,
-        ]
-
         with (
-            patch.object(ingest_script, "validate_credentials"),
-            patch.object(ingest_script, "build_connection_string", return_value="uri"),
-            patch.object(ingest_script, "MongoClient"),
-            patch.object(ingest_script, "OpenAI", return_value=openai_client),
+            patched_ingestion_clients(),
+            patch.object(
+                ingest_script,
+                "embed_text",
+                side_effect=[[0.1], RuntimeError("embed boom"), [0.2]],
+            ),
             patch.object(ingest_script, "RecursiveCharacterTextSplitter") as splitter,
         ):
             splitter.return_value.split_text.return_value = ["a", "b", "c"]
@@ -87,12 +120,25 @@ class IngestionErrorHandlingTests(unittest.TestCase):
         self.assertEqual(inserted, 2)
         self.assertTrue(any("1/3 chunks failed" in line for line in logs.output))
 
+    def test_ingest_documents_warns_when_every_chunk_is_a_duplicate(self):
+        collection = MagicMock()
+        collection.insert_one.side_effect = ingest_script.DuplicateKeyError("dupe")
+
+        with (
+            patched_ingestion_clients(collection=collection),
+            patch.object(ingest_script, "embed_text", return_value=[0.1]),
+            patch.object(ingest_script, "RecursiveCharacterTextSplitter") as splitter,
+        ):
+            splitter.return_value.split_text.return_value = ["a", "b"]
+            with self.assertLogs(ingest_script.logger, level="WARNING") as logs:
+                inserted = ingest_script.ingest_documents("text")
+
+        self.assertEqual(inserted, 0)
+        self.assertTrue(any("No new chunks ingested" in line for line in logs.output))
+
     def test_ingest_documents_rejects_empty_chunk_list(self):
         with (
-            patch.object(ingest_script, "validate_credentials"),
-            patch.object(ingest_script, "build_connection_string", return_value="uri"),
-            patch.object(ingest_script, "MongoClient"),
-            patch.object(ingest_script, "OpenAI"),
+            patched_ingestion_clients(),
             patch.object(ingest_script, "RecursiveCharacterTextSplitter") as splitter,
         ):
             splitter.return_value.split_text.return_value = []
@@ -106,31 +152,22 @@ class RetrievalErrorHandlingTests(unittest.TestCase):
         retrieval_script.mongo_client = None
         retrieval_script.collection = None
 
-    def test_env_int_rejects_non_numeric_values(self):
+    def test_malformed_search_setting_reports_variable_name(self):
         with (
-            patch.dict("os.environ", {"NUM_CANDIDATES": "many"}),
+            patch.dict("os.environ", {"RESULT_LIMIT": "two"}),
             self.assertRaises(ValueError) as ctx,
         ):
-            retrieval_script._env_int("NUM_CANDIDATES", "10")
+            retrieval_script.get_brain_response("question")
 
-        self.assertIn("must be an integer", str(ctx.exception))
+        self.assertIn("RESULT_LIMIT must be an integer", str(ctx.exception))
 
     def test_operation_failure_is_wrapped_with_cause(self):
-        openai_client = MagicMock()
-        embedding_response = MagicMock()
-        embedding_response.data = [MagicMock(embedding=[0.1])]
-        openai_client.embeddings.create.return_value = embedding_response
         failure = retrieval_script.OperationFailure("index missing")
         collection = MagicMock()
         collection.aggregate.side_effect = failure
 
         with (
-            patch.object(
-                retrieval_script, "get_openai_client", return_value=openai_client
-            ),
-            patch.object(
-                retrieval_script, "get_mongo_collection", return_value=collection
-            ),
+            patched_retrieval_clients(collection=collection),
             self.assertRaises(retrieval_script.RetrievalError) as ctx,
         ):
             retrieval_script.get_brain_response("question")
@@ -150,9 +187,6 @@ class RetrievalErrorHandlingTests(unittest.TestCase):
 
     def test_empty_completion_content_raises(self):
         openai_client = MagicMock()
-        embedding_response = MagicMock()
-        embedding_response.data = [MagicMock(embedding=[0.1])]
-        openai_client.embeddings.create.return_value = embedding_response
         completion = MagicMock()
         completion.choices = [MagicMock(message=MagicMock(content=None))]
         openai_client.chat.completions.create.return_value = completion
@@ -160,12 +194,7 @@ class RetrievalErrorHandlingTests(unittest.TestCase):
         collection.aggregate.return_value = [{"text": "context"}]
 
         with (
-            patch.object(
-                retrieval_script, "get_openai_client", return_value=openai_client
-            ),
-            patch.object(
-                retrieval_script, "get_mongo_collection", return_value=collection
-            ),
+            patched_retrieval_clients(openai_client, collection),
             self.assertRaises(retrieval_script.RetrievalError),
         ):
             retrieval_script.get_brain_response("question")
@@ -206,8 +235,8 @@ class EvaluationErrorHandlingTests(unittest.TestCase):
             answer_fn=answer_fn,
         )
 
-        self.assertEqual(results[0]["error"], None)
-        self.assertEqual(results[1]["answer"], None)
+        self.assertIsNone(results[0]["error"])
+        self.assertIsNone(results[1]["answer"])
         self.assertIn("model unavailable", results[1]["error"])
 
     def test_all_questions_failing_raises(self):
@@ -224,22 +253,21 @@ class EvaluationErrorHandlingTests(unittest.TestCase):
         self.assertIn("All 2 questions failed", str(ctx.exception))
         self.assertIsInstance(ctx.exception.__cause__, RuntimeError)
 
-    def test_write_failure_is_reported_with_path(self):
-        with TemporaryDirectory() as tmp_dir:
-            output_path = Path(tmp_dir) / "results.json"
-
-            with (
-                patch.object(Path, "write_text", side_effect=OSError("read-only")),
-                self.assertRaises(OSError) as ctx,
-            ):
-                evaluate_rag.evaluate_questions(
-                    ["a"],
-                    output_path=output_path,
-                    interactive=False,
-                    answer_fn=lambda question: "answer",
-                )
-
-        self.assertIn("Failed to write evaluation results", str(ctx.exception))
+    def test_main_returns_non_zero_when_any_question_errors(self):
+        with patch.object(
+            evaluate_rag,
+            "evaluate_questions",
+            return_value=[
+                {
+                    "question": "q",
+                    "answer": None,
+                    "score": None,
+                    "notes": "",
+                    "error": "RuntimeError: boom",
+                }
+            ],
+        ):
+            self.assertEqual(evaluate_rag.main(), 1)
 
 
 if __name__ == "__main__":

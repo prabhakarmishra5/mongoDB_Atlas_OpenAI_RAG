@@ -1,31 +1,26 @@
-import json
-import logging
-import os
-import urllib.parse
 from datetime import datetime
 from pathlib import Path
 
-from dotenv import load_dotenv
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from openai import OpenAI
-from pymongo import MongoClient
 from pymongo.errors import (
     DuplicateKeyError,
     PyMongoError,
     ServerSelectionTimeoutError,
 )
 
-# Configuration
-load_dotenv()  # Load from .env file
+from rag_common import (
+    COLLECTION_NAME,
+    DATABASE_NAME,
+    configure_logger,
+    confirm_yes,
+    connect_to_collection,
+    create_openai_client,
+    embed_text,
+    read_json_dict,
+    validate_credentials,
+    write_json,
+)
 
-MONGODB_USERNAME = os.environ.get("MONGODB_USERNAME")
-MONGODB_PASSWORD = os.environ.get("MONGODB_PASSWORD")
-MONGODB_CLUSTER = os.environ.get("MONGODB_CLUSTER", "cluster0.aefs3mv.mongodb.net")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-
-DATABASE_NAME = "rag_database"
-COLLECTION_NAME = "knowledge_base"
-EMBEDDING_MODEL = "text-embedding-3-small"
 CHUNK_SIZE = 150
 CHUNK_OVERLAP = 20
 
@@ -33,34 +28,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 SOURCE_DIR = SCRIPT_DIR / "sourceFile"
 LOG_FILE = SCRIPT_DIR / "ingestion_log.json"
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
-logger = logging.getLogger(__name__)
-
-
-def validate_credentials():
-    """Validate that all required environment variables are set."""
-    required_vars = {
-        "MONGODB_USERNAME": MONGODB_USERNAME,
-        "MONGODB_PASSWORD": MONGODB_PASSWORD,
-        "OPENAI_API_KEY": OPENAI_API_KEY,
-    }
-
-    missing = [var for var, val in required_vars.items() if not val]
-    if missing:
-        raise ValueError(f"Missing environment variables: {', '.join(missing)}")
-
-    logger.info("All credentials validated")
-
-
-def build_connection_string():
-    """Build MongoDB connection string with properly encoded credentials."""
-    username = urllib.parse.quote_plus(MONGODB_USERNAME)
-    password = urllib.parse.quote_plus(MONGODB_PASSWORD)
-    return f"mongodb+srv://{username}:{password}@{MONGODB_CLUSTER}/?appName=Cluster0&compressors=zlib"
+logger = configure_logger(__name__)
 
 
 def get_pdf_files(source_dir):
@@ -78,33 +46,10 @@ def get_pdf_files(source_dir):
 
 def load_ingestion_log(log_path=None):
     """Load the ingestion history from disk if it exists."""
-    path = Path(log_path or LOG_FILE)
-    if not path.exists():
-        return {}
-
-    try:
-        with path.open("r", encoding="utf-8") as handle:
-            data = json.load(handle)
-    except (json.JSONDecodeError, ValueError) as exc:
-        logger.warning(
-            "Could not parse ingestion log %s (%s), starting fresh", path, exc
-        )
-        return {}
-    except OSError as exc:
-        logger.warning(
-            "Could not read ingestion log %s (%s), starting fresh", path, exc
-        )
-        return {}
-
-    if not isinstance(data, dict):
-        logger.warning(
-            "Ingestion log %s contains %s instead of an object, starting fresh",
-            path,
-            type(data).__name__,
-        )
-        return {}
-
-    return data
+    return read_json_dict(
+        log_path or LOG_FILE,
+        "Could not parse ingestion log, starting fresh",
+    )
 
 
 def save_ingestion_log(log_path=None, file_name=None, timestamp=None):
@@ -113,13 +58,7 @@ def save_ingestion_log(log_path=None, file_name=None, timestamp=None):
     history = load_ingestion_log(path)
     history[file_name] = timestamp or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("w", encoding="utf-8") as handle:
-            json.dump(history, handle, indent=2)
-    except OSError as exc:
-        raise OSError(f"Failed to write ingestion log to {path}: {exc}") from exc
-
+    write_json(path, history)
     return history
 
 
@@ -133,8 +72,7 @@ def confirm_ingestion(file_name, last_ingested_at=None):
     else:
         prompt = f"Proceed to ingest '{file_name}'? Type Yes to continue: "
 
-    response = input(prompt).strip()
-    return response.lower() == "yes"
+    return confirm_yes(prompt)
 
 
 def select_single_pdf(source_dir):
@@ -192,15 +130,7 @@ def ingest_documents(raw_text):
 
     client = None
     try:
-        # Connect to MongoDB Atlas
-        mongo_uri = build_connection_string()
-        client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
-        client.admin.command("ping")
-
-        db = client[DATABASE_NAME]
-        collection = db[COLLECTION_NAME]
-
-        logger.info(f"Connected to MongoDB: {DATABASE_NAME}.{COLLECTION_NAME}")
+        client, collection = connect_to_collection(DATABASE_NAME, COLLECTION_NAME)
 
         # Create index for vector search (if not exists)
         try:
@@ -209,10 +139,8 @@ def ingest_documents(raw_text):
         except PyMongoError as exc:
             logger.warning(f"Index creation skipped: {str(exc)}")
 
-        # Initialize OpenAI Client
-        openai_client = OpenAI(api_key=OPENAI_API_KEY)
+        openai_client = create_openai_client()
 
-        # Chunk text
         splitter = RecursiveCharacterTextSplitter(
             chunk_size=CHUNK_SIZE,
             chunk_overlap=CHUNK_OVERLAP,
@@ -223,16 +151,12 @@ def ingest_documents(raw_text):
         if not chunks:
             raise ValueError("Text produced no chunks to ingest")
 
-        # Generate embeddings and ingest
         inserted_count = 0
+        duplicate_count = 0
         failures = []
         for i, chunk in enumerate(chunks):
             try:
-                response = openai_client.embeddings.create(
-                    input=chunk,
-                    model=EMBEDDING_MODEL,
-                )
-                embedding = response.data[0].embedding
+                embedding = embed_text(openai_client, chunk)
 
                 result = collection.insert_one(
                     {
@@ -246,6 +170,7 @@ def ingest_documents(raw_text):
                 logger.debug(f"Inserted chunk {i}: {result.inserted_id}")
 
             except DuplicateKeyError:
+                duplicate_count += 1
                 logger.warning(f"Chunk {i} already exists (skipped)")
             except Exception as exc:
                 logger.exception(f"Failed to ingest chunk {i}: {str(exc)}")
@@ -267,9 +192,16 @@ def ingest_documents(raw_text):
                 ", ".join(str(index) for index, _ in failures),
             )
 
-        logger.info(
-            f"Successfully ingested {inserted_count}/{len(chunks)} chunks into Atlas!"
-        )
+        if inserted_count == 0:
+            logger.warning(
+                "No new chunks ingested: all %d chunks already existed in Atlas",
+                duplicate_count,
+            )
+        else:
+            logger.info(
+                f"Successfully ingested {inserted_count}/{len(chunks)} "
+                f"chunks into Atlas ({duplicate_count} already existed)!"
+            )
         return inserted_count
 
     except ServerSelectionTimeoutError:
