@@ -25,9 +25,6 @@ EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small")
 CHAT_MODEL = os.environ.get("CHAT_MODEL", "gpt-4o-mini")
 VECTOR_INDEX_NAME = os.environ.get("VECTOR_INDEX_NAME", "vector_index")
 VECTOR_PATH = os.environ.get("VECTOR_PATH", "text_embedding")
-NUM_CANDIDATES = int(os.environ.get("NUM_CANDIDATES", "10"))
-RESULT_LIMIT = int(os.environ.get("RESULT_LIMIT", "2"))
-
 SERVER_SELECTION_TIMEOUT_MS = 5000
 LOG_FORMAT = "%(asctime)s - %(levelname)s - %(message)s"
 
@@ -39,6 +36,18 @@ def configure_logger(name: str) -> logging.Logger:
 
 
 logger = configure_logger(__name__)
+
+
+def env_int(name: str, default: int) -> int:
+    """Read an integer setting, failing loudly on malformed values."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
 
 
 def validate_credentials() -> None:
@@ -133,16 +142,32 @@ def read_json_dict(path: Union[Path, str], default_message: str) -> dict:
     try:
         with json_path.open("r", encoding="utf-8") as handle:
             data = json.load(handle)
-    except (json.JSONDecodeError, ValueError):
-        logger.warning(default_message)
+    except (json.JSONDecodeError, ValueError) as exc:
+        logger.warning("%s (%s: %s)", default_message, json_path, exc)
+        return {}
+    except OSError as exc:
+        logger.warning("Could not read %s (%s)", json_path, exc)
         return {}
 
-    return data if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        logger.warning(
+            "%s (%s contains %s instead of an object)",
+            default_message,
+            json_path,
+            type(data).__name__,
+        )
+        return {}
+
+    return data
 
 
 def write_json(path: Union[Path, str], payload: Any) -> Path:
     """Write JSON to disk, creating parent directories as needed."""
     json_path = Path(path)
-    json_path.parent.mkdir(parents=True, exist_ok=True)
-    json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    try:
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except OSError as exc:
+        raise OSError(f"Failed to write JSON to {json_path}: {exc}") from exc
+
     return json_path

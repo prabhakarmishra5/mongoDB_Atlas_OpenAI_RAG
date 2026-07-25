@@ -3,7 +3,9 @@ from pathlib import Path
 from typing import Callable, List, Optional
 
 import retrival
-from rag_common import prompt_choice, write_json
+from rag_common import configure_logger, prompt_choice, write_json
+
+logger = configure_logger(__name__)
 
 
 def run_question(
@@ -38,29 +40,57 @@ def evaluate_questions(
     output_path: Optional[Path | str] = None,
     interactive: bool = True,
     score_fn: Optional[Callable[[str], tuple[Optional[int], str]]] = None,
+    answer_fn: Optional[Callable[[str], str]] = None,
 ):
-    """Evaluate a list of questions and save the results as JSON."""
+    """
+    Evaluate a list of questions and save the results as JSON.
+
+    A failing question is recorded with its error message and evaluation
+    continues. If every question fails, the last error is raised so callers
+    (and CI) do not treat the run as successful.
+
+    Raises:
+        RuntimeError: If no question could be answered.
+        OSError: If the results cannot be written to output_path.
+    """
     results = []
+    failures = []
     scorer = score_fn or (lambda answer: score_answer(answer, interactive=interactive))
     for question in questions:
-        answer = run_question(question)
-        score, notes = scorer(answer)
+        try:
+            answer = run_question(question, answer_fn=answer_fn)
+            score, notes = scorer(answer)
+            error = None
+        except Exception as exc:
+            logger.exception("Evaluation failed for question: %s", question)
+            failures.append(exc)
+            answer, score, notes = None, None, ""
+            error = f"{type(exc).__name__}: {exc}"
+
         results.append(
             {
                 "question": question,
                 "answer": answer,
                 "score": score,
                 "notes": notes,
+                "error": error,
             }
         )
 
     if output_path is not None:
         write_json(output_path, results)
 
+    if questions and len(failures) == len(questions):
+        raise RuntimeError(
+            f"All {len(questions)} questions failed to evaluate; "
+            f"last error: {failures[-1]}"
+        ) from failures[-1]
+
     return results
 
 
-if __name__ == "__main__":
+def main() -> int:
+    """Run the sample evaluation, reporting failures with a non-zero exit code."""
     sample_questions = [
         "What does MongoDB Atlas Vector Search eliminate the need for?",
         "What is the purpose of this system?",
@@ -68,14 +98,31 @@ if __name__ == "__main__":
         "How old I am?",
         "How old are you?",
     ]
-    results = evaluate_questions(
-        sample_questions,
-        output_path="evaluation_results.json",
-    )
+    try:
+        results = evaluate_questions(
+            sample_questions,
+            output_path="evaluation_results.json",
+        )
+    except KeyboardInterrupt:
+        print("Evaluation cancelled by user.")
+        return 130
+    except Exception as exc:
+        logger.exception("Evaluation run failed: %s", exc)
+        return 1
+    finally:
+        retrival.close_clients()
+
     for result in results:
         print(
             f"Q: {result['question']}\n"
             f"A: {result['answer']}\n"
             f"Score: {result['score']}\n"
-            f"Notes: {result['notes']}\n",
+            f"Notes: {result['notes']}\n"
+            f"Error: {result['error']}\n",
         )
+
+    return 1 if any(result["error"] for result in results) else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

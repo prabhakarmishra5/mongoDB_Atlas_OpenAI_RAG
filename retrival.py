@@ -1,14 +1,17 @@
 import argparse
 from typing import Optional, Sequence
 
-from pymongo.errors import OperationFailure, ServerSelectionTimeoutError
+from openai import OpenAIError
+from pymongo.errors import (
+    OperationFailure,
+    PyMongoError,
+    ServerSelectionTimeoutError,
+)
 
 from rag_common import (
     CHAT_MODEL,
     COLLECTION_NAME,
     DATABASE_NAME,
-    NUM_CANDIDATES,
-    RESULT_LIMIT,
     VECTOR_INDEX_NAME,
     VECTOR_PATH,
     configure_logger,
@@ -16,10 +19,16 @@ from rag_common import (
     connect_to_collection,
     create_openai_client,
     embed_text,
+    env_int,
     prompt_non_empty,
 )
 
 logger = configure_logger(__name__)
+
+
+class RetrievalError(RuntimeError):
+    """Raised when the retrieval pipeline cannot produce an answer."""
+
 
 openai_client = None
 mongo_client = None
@@ -49,9 +58,14 @@ def close_clients():
     """Close any open MongoDB client connection."""
     global mongo_client, collection
     if mongo_client is not None:
-        mongo_client.close()
-        mongo_client = None
-        collection = None
+        try:
+            mongo_client.close()
+        except Exception as exc:
+            # Never let cleanup mask the original failure.
+            logger.warning(f"Failed to close MongoDB connection: {str(exc)}")
+        finally:
+            mongo_client = None
+            collection = None
 
 
 def prompt_for_question():
@@ -78,13 +92,16 @@ def get_brain_response(user_query):
         str: The LLM-generated response
 
     Raises:
-        ValueError: If user_query is empty or invalid
-        Exception: If API calls fail
+        ValueError: If user_query is empty or a search setting is malformed
+        ConnectionError: If MongoDB Atlas is unreachable
+        RetrievalError: If the MongoDB query or an OpenAI call fails
     """
     if not user_query or not user_query.strip():
         raise ValueError("User query cannot be empty")
 
     user_query = user_query.strip()
+    num_candidates = env_int("NUM_CANDIDATES", 10)
+    result_limit = env_int("RESULT_LIMIT", 2)
 
     try:
         openai_client_instance = get_openai_client()
@@ -98,8 +115,8 @@ def get_brain_response(user_query):
                     "index": VECTOR_INDEX_NAME,
                     "path": VECTOR_PATH,
                     "queryVector": query_embedding,
-                    "numCandidates": NUM_CANDIDATES,
-                    "limit": RESULT_LIMIT,
+                    "numCandidates": num_candidates,
+                    "limit": result_limit,
                 }
             },
             {"$project": {"_id": 0, "text": 1}},
@@ -125,14 +142,23 @@ def get_brain_response(user_query):
             ],
         )
 
-        return completion.choices[0].message.content
+        if not completion.choices:
+            raise RetrievalError(f"{CHAT_MODEL} returned no completion choices")
+
+        answer = completion.choices[0].message.content
+        if answer is None or not answer.strip():
+            raise RetrievalError(f"{CHAT_MODEL} returned an empty answer")
+
+        return answer
 
     except ServerSelectionTimeoutError as exc:
-        raise ConnectionError("Failed to connect to MongoDB Atlas") from exc
+        raise ConnectionError(f"Failed to connect to MongoDB Atlas: {exc}") from exc
     except OperationFailure as exc:
-        raise Exception(f"MongoDB query failed: {str(exc)}")
-    except Exception as exc:
-        raise Exception(f"Error in get_brain_response: {str(exc)}")
+        raise RetrievalError(f"MongoDB query failed: {exc}") from exc
+    except PyMongoError as exc:
+        raise RetrievalError(f"MongoDB request failed: {exc}") from exc
+    except OpenAIError as exc:
+        raise RetrievalError(f"OpenAI request failed: {exc}") from exc
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -162,8 +188,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"Query: {user_question}\n")
         print(f"Response: {response}")
         return 0
+    except KeyboardInterrupt:
+        print("Operation cancelled by user.")
+        return 130
+    except (RetrievalError, ConnectionError, ValueError) as exc:
+        logger.error(str(exc))
+        return 1
     except Exception as exc:
-        print(f"Error: {str(exc)}")
+        logger.exception(f"Unexpected failure: {str(exc)}")
         return 1
     finally:
         close_clients()

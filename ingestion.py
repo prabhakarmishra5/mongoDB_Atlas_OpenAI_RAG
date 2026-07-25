@@ -2,7 +2,11 @@ from datetime import datetime
 from pathlib import Path
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from pymongo.errors import DuplicateKeyError, ServerSelectionTimeoutError
+from pymongo.errors import (
+    DuplicateKeyError,
+    PyMongoError,
+    ServerSelectionTimeoutError,
+)
 
 from rag_common import (
     COLLECTION_NAME,
@@ -132,7 +136,7 @@ def ingest_documents(raw_text):
         try:
             collection.create_index([("text_embedding", "2dsphere")])
             logger.info("Vector search index ready")
-        except Exception as exc:
+        except PyMongoError as exc:
             logger.warning(f"Index creation skipped: {str(exc)}")
 
         openai_client = create_openai_client()
@@ -144,7 +148,12 @@ def ingest_documents(raw_text):
         chunks = splitter.split_text(raw_text)
         logger.info(f"Text split into {len(chunks)} chunks")
 
+        if not chunks:
+            raise ValueError("Text produced no chunks to ingest")
+
         inserted_count = 0
+        duplicate_count = 0
+        failures = []
         for i, chunk in enumerate(chunks):
             try:
                 embedding = embed_text(openai_client, chunk)
@@ -161,28 +170,57 @@ def ingest_documents(raw_text):
                 logger.debug(f"Inserted chunk {i}: {result.inserted_id}")
 
             except DuplicateKeyError:
+                duplicate_count += 1
                 logger.warning(f"Chunk {i} already exists (skipped)")
             except Exception as exc:
-                logger.error(f"Failed to ingest chunk {i}: {str(exc)}")
+                logger.exception(f"Failed to ingest chunk {i}: {str(exc)}")
+                failures.append((i, exc))
                 continue
 
-        logger.info(
-            f"Successfully ingested {inserted_count}/{len(chunks)} chunks into Atlas!"
-        )
+        if failures and inserted_count == 0:
+            first_index, first_exc = failures[0]
+            raise RuntimeError(
+                f"No chunks were ingested: {len(failures)}/{len(chunks)} failed "
+                f"({duplicate_count} already existed); "
+                f"first failure on chunk {first_index}: {first_exc}"
+            ) from first_exc
+
+        if failures:
+            logger.error(
+                "%d/%d chunks failed to ingest (chunk ids: %s)",
+                len(failures),
+                len(chunks),
+                ", ".join(str(index) for index, _ in failures),
+            )
+
+        if inserted_count == 0:
+            logger.warning(
+                "No new chunks ingested: all %d chunks already existed in Atlas",
+                duplicate_count,
+            )
+        else:
+            logger.info(
+                f"Successfully ingested {inserted_count}/{len(chunks)} "
+                f"chunks into Atlas ({duplicate_count} already existed)!"
+            )
         return inserted_count
 
     except ServerSelectionTimeoutError:
-        logger.error(
+        logger.exception(
             "Failed to connect to MongoDB Atlas. Check your connection string."
         )
         raise
     except Exception as exc:
-        logger.error(f"Ingestion failed: {str(exc)}")
+        logger.exception(f"Ingestion failed: {str(exc)}")
         raise
     finally:
         if client is not None:
-            client.close()
-            logger.info("MongoDB connection closed")
+            try:
+                client.close()
+                logger.info("MongoDB connection closed")
+            except Exception as exc:
+                # Never let cleanup mask the original failure.
+                logger.warning(f"Failed to close MongoDB connection: {str(exc)}")
 
 
 def main():
@@ -200,8 +238,13 @@ def main():
     inserted_count = ingest_documents(raw_text)
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    save_ingestion_log(LOG_FILE, selected_pdf.name, timestamp)
-    logger.info("Logged ingestion for %s at %s", selected_pdf.name, timestamp)
+    try:
+        save_ingestion_log(LOG_FILE, selected_pdf.name, timestamp)
+        logger.info("Logged ingestion for %s at %s", selected_pdf.name, timestamp)
+    except OSError:
+        # Ingestion already succeeded, so surface the bookkeeping failure
+        # without discarding the result.
+        logger.exception("Could not record ingestion history for %s", selected_pdf.name)
     print(f"Ingested {inserted_count} chunks from {selected_pdf.name}")
     return inserted_count
 
@@ -209,6 +252,9 @@ def main():
 if __name__ == "__main__":
     try:
         main()
+    except KeyboardInterrupt:
+        logger.warning("Ingestion interrupted by user")
+        raise SystemExit(130) from None
     except Exception as exc:
-        logger.error(f"Script failed: {str(exc)}")
-        raise SystemExit(1)
+        logger.exception(f"Script failed: {str(exc)}")
+        raise SystemExit(1) from exc
