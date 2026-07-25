@@ -1,9 +1,9 @@
-import json
 import sys
 from pathlib import Path
 from typing import Callable, List, Optional
 
 import retrival
+from rag_common import prompt_choice, write_json
 
 
 def run_question(
@@ -23,10 +23,11 @@ def score_answer(answer: str, interactive: bool = True) -> tuple[Optional[int], 
 
     print("\nScore the answer on a 1-5 scale:")
     print("1 = poor, 2 = weak, 3 = acceptable, 4 = good, 5 = excellent")
-    score = input("Score (1-5): ").strip()
-    while score not in {"1", "2", "3", "4", "5"}:
-        print("Please enter a number from 1 to 5.")
-        score = input("Score (1-5): ").strip()
+    score = prompt_choice(
+        "Score (1-5): ",
+        {"1", "2", "3", "4", "5"},
+        "Please enter a number from 1 to 5.",
+    )
 
     notes = input("Optional notes: ").strip()
     return int(score), notes
@@ -54,9 +55,7 @@ def evaluate_questions(
         )
 
     if output_path is not None:
-        path = Path(output_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(results, indent=2), encoding="utf-8")
+        write_json(output_path, results)
 
     return results
 
