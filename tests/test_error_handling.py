@@ -99,7 +99,7 @@ class IngestionErrorHandlingTests(unittest.TestCase):
         ):
             ingest_script.ingest_documents("some text " * 100)
 
-        self.assertIn("failed to ingest", str(ctx.exception))
+        self.assertIn("No chunks were ingested", str(ctx.exception))
         self.assertIsInstance(ctx.exception.__cause__, RuntimeError)
         mongo_client.close.assert_called_once()
 

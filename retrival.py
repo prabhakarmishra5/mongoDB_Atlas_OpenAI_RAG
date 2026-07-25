@@ -60,7 +60,7 @@ def close_clients():
     if mongo_client is not None:
         try:
             mongo_client.close()
-        except PyMongoError as exc:
+        except Exception as exc:
             # Never let cleanup mask the original failure.
             logger.warning(f"Failed to close MongoDB connection: {str(exc)}")
         finally:

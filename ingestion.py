@@ -180,7 +180,8 @@ def ingest_documents(raw_text):
         if failures and inserted_count == 0:
             first_index, first_exc = failures[0]
             raise RuntimeError(
-                f"All {len(chunks)} chunks failed to ingest; "
+                f"No chunks were ingested: {len(failures)}/{len(chunks)} failed "
+                f"({duplicate_count} already existed); "
                 f"first failure on chunk {first_index}: {first_exc}"
             ) from first_exc
 
@@ -217,7 +218,7 @@ def ingest_documents(raw_text):
             try:
                 client.close()
                 logger.info("MongoDB connection closed")
-            except PyMongoError as exc:
+            except Exception as exc:
                 # Never let cleanup mask the original failure.
                 logger.warning(f"Failed to close MongoDB connection: {str(exc)}")
 
