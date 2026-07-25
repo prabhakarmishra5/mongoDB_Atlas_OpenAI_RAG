@@ -1,6 +1,6 @@
 import unittest
 
-from security import MAX_QUERY_LENGTH, redact_credentials, sanitize_query
+from rag_common import MAX_QUERY_LENGTH, redact_credentials, sanitize_query
 
 
 class RedactCredentialsTests(unittest.TestCase):
